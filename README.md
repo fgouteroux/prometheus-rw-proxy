@@ -86,6 +86,10 @@ log_level: warn
 # env: CT_TIMEOUT
 timeout: 10s
 
+# HTTP request idle timeout
+# env: CT_IDLE_TIMEOUT
+idle_timeout: 60s
+
 # Timeout to wait on shutdown to allow load balancers detect that we're going away.
 # During this period after the shutdown command the /alive endpoint will reply with HTTP 503.
 # Set to 0s to disable.

@@ -195,6 +195,12 @@
           "description": "HTTP request timeout",
           "format": "duration"
         },
+        "idle_timeout": {
+          "type": "string",
+          "title": "Idle_Timeout",
+          "description": "HTTP request idle timeout",
+          "format": "duration"
+        },
         "timeout_shutdown": {
           "type": "string",
           "title": "Shutdown timeout",

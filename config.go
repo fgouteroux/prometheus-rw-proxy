@@ -22,6 +22,7 @@ type config struct {
 
 	LogLevel          string        `yaml:"log_level" env:"CT_LOG_LEVEL"`
 	Timeout           time.Duration `env:"CT_TIMEOUT"`
+	IdleTimeout       time.Duration `yaml:"idle_timeout" env:"CT_IDLE_TIMEOUT"`
 	TimeoutShutdown   time.Duration `yaml:"timeout_shutdown" env:"CT_TIMEOUT_SHUTDOWN"`
 	Concurrency       int           `env:"CT_CONCURRENCY"`
 	Metadata          bool          `env:"CT_METADATA"`
@@ -87,6 +88,10 @@ func configLoad(file string) (*config, error) {
 
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 10 * time.Second
+	}
+
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = 60 * time.Second
 	}
 
 	if cfg.Concurrency == 0 {

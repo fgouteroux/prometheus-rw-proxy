@@ -17,6 +17,8 @@ data:
     log_level: warn
     # HTTP request timeout
     timeout: 10s
+    # HTTP request idle timeout
+    idle_timeout: 60s
     # Timeout to wait on shutdown to allow load balancers detect that we're going away.
     # During this period after the shutdown command the /alive endpoint will reply with HTTP 503.
     # Set to 0s to disable.

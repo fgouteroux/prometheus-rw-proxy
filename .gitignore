@@ -8,3 +8,4 @@ config.yaml
 .vscode
 .idea
 .DS_Store
+cover.out

@@ -1,14 +1,6 @@
-# cortex-tenant
-
-[![Go Report Card](https://goreportcard.com/badge/github.com/blind-oracle/cortex-tenant)](https://goreportcard.com/report/github.com/blind-oracle/cortex-tenant)
-[![Coverage Status](https://coveralls.io/repos/github/blind-oracle/cortex-tenant/badge.svg?branch=main)](https://coveralls.io/github/blind-oracle/cortex-tenant?branch=main)
-[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/cortex-tenant)](https://artifacthub.io/packages/helm/cortex-tenant/cortex-tenant)
+# prometheus-rw-proxy
 
 Prometheus remote write proxy which marks timeseries with a Cortex/Mimir tenant ID based on labels.
-
-## Status
-
-The project is stable and (hopefully) almost bug-free. I will accept PRs, but probably will not do any active work on it for now since I don't work with Cortex/Mimir currently.
 
 ## Architecture
 
@@ -32,12 +24,10 @@ This software solves the problem using the following logic:
 
 ## Usage
 
-- Get `rpm` or `deb` for amd64 from the Releases page. For building see below.
-
 ### HTTP Endpoints
 
-- GET `/alive` returns 200 by default and 503 if the service is shutting down (if `timeout_shutdown` setting is > 0)
-- POST `/push` receives metrics from Prometheus - configure remote write to send here
+- GET `/-/ready` returns 200 by default and 503 if the service is shutting down (if `timeout_shutdown` setting is > 0)
+- POST `/api/v1/write` receives metrics from Prometheus - configure remote write to send here
 
 ### Configuration
 
@@ -48,119 +38,131 @@ See below for config file format and corresponding env vars.
 
 ```yaml
 # Where to listen for incoming write requests from Prometheus
-# env: CT_LISTEN
+# env: PRWPROXY_LISTEN
 listen: 0.0.0.0:8080
 
+# listen path for incoming write requests from Prometheus
+# env: PRWPROXY_LISTEN_PATH
+listen_path: /api/v1/write
+
 # Profiling API, remove to disable
-# env: CT_LISTEN_PPROF
+# env: PRWPROXY_LISTEN_PPROF
 listen_pprof: 0.0.0.0:7008
 
+# enable tls setting
+tls_cert_file: ""
+tls_key_file: ""
+
 # Where to send the modified requests (Cortex/Mimir)
-# env: CT_TARGET
+# env: PRWPROXY_TARGET
 target: http://127.0.0.1:9091/receive
 
 # Whether to enable querying for IPv6 records
-# env: CT_ENABLE_IPV6
+# env: PRWPROXY_ENABLE_IPV6
 enable_ipv6: false
+
+# Whether to enable HTTP2 
+# env: PRWPROXY_ENABLE_HTTP2
+enable_http2: true
 
 # This parameter sets the limit for the count of outgoing concurrent connections to Cortex / Mimir.
 # By default it's 64 and if all of these connections are busy you will get errors when pushing from Prometheus.
 # If your `target` is a DNS name that resolves to several IPs then this will be a per-IP limit.
-# env: CT_MAX_CONNS_PER_HOST
+# env: PRWPROXY_MAX_CONNS_PER_HOST
 max_conns_per_host: 0
 
 # Authentication (optional)
 auth:
   # Egress HTTP basic auth -> add `Authentication` header to outgoing requests
   egress:
-    # env: CT_AUTH_EGRESS_USERNAME
+    # env: PRWPROXY_AUTH_EGRESS_USERNAME
     username: foo
-    # env: CT_AUTH_EGRESS_PASSWORD
+    # env: PRWPROXY_AUTH_EGRESS_PASSWORD
     password: bar
 
 # Log level
-# env: CT_LOG_LEVEL
+# env: PRWPROXY_LOG_LEVEL
 log_level: warn
 
 # HTTP request timeout
-# env: CT_TIMEOUT
+# env: PRWPROXY_TIMEOUT
 timeout: 10s
 
 # HTTP request idle timeout
-# env: CT_IDLE_TIMEOUT
+# env: PRWPROXY_IDLE_TIMEOUT
 idle_timeout: 60s
 
 # Timeout to wait on shutdown to allow load balancers detect that we're going away.
 # During this period after the shutdown command the /alive endpoint will reply with HTTP 503.
 # Set to 0s to disable.
-# env: CT_TIMEOUT_SHUTDOWN
+# env: PRWPROXY_TIMEOUT_SHUTDOWN
 timeout_shutdown: 10s
 
 # Max number of parallel incoming HTTP requests to handle
-# env: CT_CONCURRENCY
+# env: PRWPROXY_CONCURRENCY
 concurrency: 10
 
 # Whether to forward metrics metadata from Prometheus to Cortex/Mimir
 # Since metadata requests have no timeseries in them - we cannot divide them into tenants
 # So the metadata requests will be sent to the default tenant only, if one is not defined - they will be dropped
-# env: CT_METADATA
+# env: PRWPROXY_METADATA
 metadata: false
 
 # If true response codes from metrics backend will be logged to stdout. This setting can be used to suppress errors
 # which can be quite verbose like 400 code - out-of-order samples or 429 on hitting ingestion limits
 # Also, those are already reported by other services like Cortex/Mimir distributors and ingesters
-# env: CT_LOG_RESPONSE_ERRORS
+# env: PRWPROXY_LOG_RESPONSE_ERRORS
 log_response_errors: true
 
 # Maximum duration to keep outgoing connections alive (to Cortex/Mimir)
 # Useful for resetting L4 load-balancer state
 # Use 0 to keep them indefinitely
-# env: CT_MAX_CONN_DURATION
+# env: PRWPROXY_MAX_CONN_DURATION
 max_connection_duration: 0s
 
 # Address where metrics are available
-# env: CT_LISTEN_METRICS_ADDRESS
+# env: PRWPROXY_LISTEN_METRICS_ADDRESS
 listen_metrics_address: 0.0.0.0:9090
 
 # If true, then a label with the tenant’s name will be added to the metrics
-# env: CT_METRICS_INCLUDE_TENANT
+# env: PRWPROXY_METRICS_INCLUDE_TENANT
 metrics_include_tenant: true
 
 tenant:
   # Which label to look for the tenant information
-  # env: CT_TENANT_LABEL
+  # env: PRWPROXY_TENANT_LABEL
   label: tenant
 
   # List of labels examined for tenant information. If set takes precedent over `label`
-  # env: CT_TENANT_LABEL_LIST
+  # env: PRWPROXY_TENANT_LABEL_LIST
   label_list:
     - tenant
     - other_tenant
 
   # Whether to remove the tenant label from the request
-  # env: CT_TENANT_LABEL_REMOVE
+  # env: PRWPROXY_TENANT_LABEL_REMOVE
   label_remove: true
   
   # To which header to add the tenant ID
-  # env: CT_TENANT_HEADER
+  # env: PRWPROXY_TENANT_HEADER
   header: X-Scope-OrgID
 
   # Which tenant ID to use if the label is missing in any of the timeseries
   # If this is not set or empty then the write request with missing tenant label
   # will be rejected with HTTP code 400
-  # env: CT_TENANT_DEFAULT
+  # env: PRWPROXY_TENANT_DEFAULT
   default: foobar
 
   # Enable if you want all metrics from Prometheus to be accepted with a 204 HTTP code
   # regardless of the response from upstream. This can lose metrics if Cortex/Mimir is
   # throwing rejections.
-  # env: CT_TENANT_ACCEPT_ALL
+  # env: PRWPROXY_TENANT_ACCEPT_ALL
   accept_all: false
 
   # Optional prefix to be added to a tenant header before sending it to Cortex/Mimir.
   # Make sure to use only allowed characters:
   # https://grafana.com/docs/mimir/latest/configure/about-tenant-ids/
-  # env: CT_TENANT_PREFIX
+  # env: PRWPROXY_TENANT_PREFIX
   prefix: foobar-
 
   # If true will use the tenant ID of the inbound request as the prefix of the new tenant id.
@@ -169,16 +171,23 @@ tenant:
   #   Prometheus forwards metrics with `X-Scope-OrgID: Prom-A` set in the inbound request.
   #   This would result in the tenant prefix being set to `Prom-A-`.
   # https://grafana.com/docs/mimir/latest/configure/about-tenant-ids/
-  # env: CT_TENANT_PREFIX_PREFER_SOURCE
+  # env: PRWPROXY_TENANT_PREFIX_PREFER_SOURCE
   prefix_prefer_source: false
+
+  # apply a regex to match a tenant label value. The tenant id will be the key of label_value_matcher. Order matters.
+  label_value_matcher:
+    - name: tenant-group1
+      regex: tenant1|tenant2
+    - name: tenant-group2
+      regex: tenant3|tenant4
 ```
 
 ### Prometheus configuration example
 
 ```yaml
 remote_write:
-  - name: cortex_tenant
-    url: http://127.0.0.1:8080/push
+  - name: prometheus-rw-proxy
+    url: http://127.0.0.1:8080/api/v1/write
 
 scrape_configs:
   - job_name: job1
@@ -200,62 +209,3 @@ scrape_configs:
 
 This would result in `job1` metrics ending up in the `foobar` tenant in Cortex/Mimir and `job2` in `deadbeef`.
 
-## Building
-
-`make build` should create you an _amd64_ binary.
-
-If you want `deb` or `rpm` packages then install [FPM](https://fpm.readthedocs.io) and then run `make rpm` or `make deb` to create the packages.
-
-## Containerization
-
-To use the current container you need to overwrite the default configuration file, mount your configuration into to `/data/cortex-tenant.yml`.
-
-You can overwrite the default config by starting the container with:
-
-```bash
-docker container run \
--v <CONFIG_LOCATION>:/data/cortex-tenant.yml \
-ghcr.io/blind-oracle/cortex-tenant:1.6.1
-```
-
-... or build your own Docker image:
-
-```Dockerfile
-FROM ghcr.io/blind-oracle/cortex-tenant:1.6.1
-ADD my-config.yml /data/cortex-tenant.yml
-```
-
-### Deploy on Kubernetes
-
-#### Using manifests
-
-[`deploy/k8s/manifests`](deploy/k8s/manifests) directory contains the deployment, service and configmap manifest files for deploying this on Kubernetes. You can overwrite the default config by editing the configuration parameters in the configmap manifest.
-
-```bash
-kubectl apply -f deploy/k8s/manifests/cortex-tenant-deployment.yaml
-kubectl apply -f deploy/k8s/manifests/cortex-tenant-service.yaml
-kubectl apply -f deploy/k8s/manifests/config-file-configmap.yml
-```
-
-#### Using a Helm Chart
-
-[`deploy/k8s/chart`](deploy/k8s/chart) directory contains a chart for deploying this on Kubernetes.
-
-```bash
-helm repo add cortex-tenant https://blind-oracle.github.io/cortex-tenant
-helm install cortex-tenant cortex-tenant/cortex-tenant
-```
-
-You can use [`deploy/k8s/chart/testing`](deploy/k8s/chart/testing) directory to test the deployment using helmfile.
-
-```bash
-helmfile -f deploy/k8s/chart/testing/helmfile.yaml template
-helmfile -f deploy/k8s/chart/testing/helmfile.yaml apply
-```
-
-#### Updating chart version
-
-```bash
-helm package ./deploy/k8s/chart -d docs
-TZ=UTC helm repo index ./docs
-```

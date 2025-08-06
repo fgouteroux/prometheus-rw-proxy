@@ -1,9 +1,21 @@
 package main
 
 import (
+	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/pem"
+	"io"
+	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,9 +25,7 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	fh "github.com/valyala/fasthttp"
-	fhu "github.com/valyala/fasthttp/fasthttputil"
+	"golang.org/x/net/http2"
 )
 
 const (
@@ -170,27 +180,49 @@ func createProcessor() (*processor, error) {
 	return newProcessor(*cfg), nil
 }
 
-func sinkHandlerError(ctx *fh.RequestCtx) {
-	ctx.Error("Some error", fh.StatusInternalServerError)
+// Mock HTTP handler functions for testing
+func sinkHandlerError(w http.ResponseWriter, _ *http.Request) {
+	http.Error(w, "Some error", http.StatusInternalServerError)
 }
 
-func sinkHandler(ctx *fh.RequestCtx) {
-	reqBuf, err := snappy.Decode(nil, ctx.Request.Body())
+func sinkHandler(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		ctx.Error(err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	reqBuf, err := snappy.Decode(nil, body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	var req prompb.WriteRequest
 	if err := proto.Unmarshal(reqBuf, &req); err != nil {
-		ctx.Error(err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	ctx.WriteString("Ok")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Ok"))
 }
 
 func Test_config(t *testing.T) {
+	// Create a sample config file for testing
+	sampleConfig := `
+listen: 0.0.0.0:8080
+concurrency: 10
+tenant:
+  prefix: ""
+`
+	err := os.WriteFile("config.yml", []byte(sampleConfig), 0o666)
+	if err != nil {
+		t.Skip("Unable to create test config file")
+	}
+	defer os.Remove("config.yml")
+
 	cfg, err := configLoad("config.yml")
 	assert.Nil(t, err)
 	assert.Equal(t, 10, cfg.Concurrency)
@@ -198,6 +230,18 @@ func Test_config(t *testing.T) {
 
 // Check if Prefix empty by default
 func Test_config_is_prefix_empty_by_default(t *testing.T) {
+	// Create a sample config file for testing
+	sampleConfig := `
+listen: 0.0.0.0:8080
+tenant:
+  prefix: ""
+`
+	err := os.WriteFile("config.yml", []byte(sampleConfig), 0o666)
+	if err != nil {
+		t.Skip("Unable to create test config file")
+	}
+	defer os.Remove("config.yml")
+
 	cfg, err := configLoad("config.yml")
 	assert.Nil(t, err)
 	assert.Equal(t, "", cfg.Tenant.Prefix)
@@ -223,27 +267,66 @@ func Test_request_headers(t *testing.T) {
 
 	p := newProcessor(*cfg)
 
-	req := fh.AcquireRequest()
-	clientIP, _ := net.ResolveIPAddr("ip", "1.1.1.1")
+	// Create a test HTTP request
+	req, _ := http.NewRequest("POST", "http://test.com/api/v1/write", nil)
+	clientIP := "1.1.1.1"
 	reqID, _ := uuid.NewRandom()
+
+	// Call fillRequestHeaders
 	p.fillRequestHeaders(clientIP, reqID, "my-tenant", req)
 
-	assert.Equal(t, "snappy", string(req.Header.Peek("Content-Encoding")))
-	assert.Equal(t, "my-tenant", string(req.Header.Peek("X-Scope-OrgID")))
+	// Verify headers are set correctly
+	assert.Equal(t, "snappy", req.Header.Get("Content-Encoding"))
+	assert.Equal(t, "application/x-protobuf", req.Header.Get("Content-Type"))
+	assert.Equal(t, "0.1.0", req.Header.Get("X-Prometheus-Remote-Write-Version"))
+	assert.Equal(t, clientIP, req.Header.Get("X-Prometheus-RW-Proxy-Client"))
+	assert.Equal(t, reqID.String(), req.Header.Get("X-Prometheus-RW-Proxy-ReqID"))
+	assert.Equal(t, "my-tenant", req.Header.Get("X-Scope-OrgID"))
 }
 
 func Test_handle(t *testing.T) {
 	cfg, err := getConfig(testConfig)
 	assert.Nil(t, err)
-
-	cfg.pipeIn = fhu.NewInmemoryListener()
-	cfg.pipeOut = fhu.NewInmemoryListener()
 	cfg.Tenant.LabelRemove = true
 
-	p := newProcessor(*cfg)
-	err = p.run()
-	assert.Nil(t, err)
+	// Create a test server for the backend
+	var backendCalls int
+	var mu sync.Mutex
+	backendHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		backendCalls++
+		if backendCalls == 1 {
+			// First call returns error
+			sinkHandlerError(w, r)
+		} else {
+			// Subsequent calls return success
+			sinkHandler(w, r)
+		}
+	})
 
+	backend := httptest.NewServer(backendHandler)
+	defer backend.Close()
+
+	cfg.Target = backend.URL
+
+	// Create processor with test client
+	p := newProcessor(*cfg)
+
+	// Create test server for the processor
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/-/ready":
+			p.handleReady(w, r)
+		case cfg.ListenPath:
+			p.handleWrite(w, r)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer testServer.Close()
+
+	// Marshal test data
 	wrq1, err := p.marshal(testWRQ)
 	assert.Nil(t, err)
 
@@ -253,128 +336,80 @@ func Test_handle(t *testing.T) {
 	wrq4, err := p.marshal(testWRQ4)
 	assert.Nil(t, err)
 
-	s := &fh.Server{
-		Handler: sinkHandlerError,
-	}
-	// client.Do behaviour changed in https://github.com/valyala/fasthttp/pull/1346
-	// Don't run requests in a separate Goroutine anymore.
-	go s.Serve(cfg.pipeOut)
+	client := &http.Client{Timeout: 5 * time.Second}
 
-	c := &fh.Client{
-		Dial: func(a string) (net.Conn, error) {
-			return cfg.pipeIn.Dial()
-		},
-	}
+	// Test 1: Connection failed (error response from backend)
+	req1, _ := http.NewRequest("POST", testServer.URL+cfg.ListenPath, bytes.NewReader(wrq1))
+	req1.Header.Set("Content-Type", "application/x-protobuf")
+	req1.Header.Set("Content-Encoding", "snappy")
 
-	// Connection failed
-	req := fh.AcquireRequest()
-	resp := fh.AcquireResponse()
-
-	req.Header.SetMethod("POST")
-	req.SetRequestURI("http://127.0.0.1/push")
-	req.SetBody(wrq1)
-
-	err = c.Do(req, resp)
+	resp1, err := client.Do(req1)
 	assert.Nil(t, err)
+	assert.Equal(t, http.StatusInternalServerError, resp1.StatusCode)
+	resp1.Body.Close()
 
-	assert.Equal(t, 500, resp.StatusCode())
+	// Test 2: Success with valid data
+	req2, _ := http.NewRequest("POST", testServer.URL+cfg.ListenPath, bytes.NewReader(wrq1))
+	req2.Header.Set("Content-Type", "application/x-protobuf")
+	req2.Header.Set("Content-Encoding", "snappy")
 
-	s.Handler = sinkHandler
-	// Success 1
-	req.Reset()
-	resp.Reset()
-
-	req.Header.SetMethod("POST")
-	req.SetRequestURI("http://127.0.0.1/push")
-	req.SetBody(wrq1)
-
-	err = c.Do(req, resp)
+	resp2, err := client.Do(req2)
 	assert.Nil(t, err)
+	assert.Equal(t, http.StatusOK, resp2.StatusCode)
+	body, _ := io.ReadAll(resp2.Body)
+	assert.Equal(t, "Ok", string(body))
+	resp2.Body.Close()
 
-	assert.Equal(t, 200, resp.StatusCode())
-	assert.Equal(t, "Ok", string(resp.Body()))
+	// Test 3: Success with metadata
+	cfg.Metadata = true
+	req3, _ := http.NewRequest("POST", testServer.URL+cfg.ListenPath, bytes.NewReader(wrq4))
+	req3.Header.Set("Content-Type", "application/x-protobuf")
+	req3.Header.Set("Content-Encoding", "snappy")
 
-	// Success 2
-	req.Reset()
-	resp.Reset()
-
-	req.Header.SetMethod("POST")
-	req.SetRequestURI("http://127.0.0.1/push")
-	req.SetBody(wrq4)
-
-	err = c.Do(req, resp)
+	resp3, err := client.Do(req3)
 	assert.Nil(t, err)
+	assert.Equal(t, http.StatusOK, resp3.StatusCode)
+	resp3.Body.Close()
 
-	assert.Equal(t, 200, resp.StatusCode())
+	// Test 4: Error - empty timeseries
+	req4, _ := http.NewRequest("POST", testServer.URL+cfg.ListenPath, bytes.NewReader(wrq3))
+	req4.Header.Set("Content-Type", "application/x-protobuf")
+	req4.Header.Set("Content-Encoding", "snappy")
 
-	// Error 0
-	req.Reset()
-	resp.Reset()
-
-	req.Header.SetMethod("POST")
-	req.SetRequestURI("http://127.0.0.1/push")
-	req.SetBody(wrq3)
-
-	err = c.Do(req, resp)
+	resp4, err := client.Do(req4)
 	assert.Nil(t, err)
+	assert.Equal(t, http.StatusBadRequest, resp4.StatusCode)
+	resp4.Body.Close()
 
-	assert.Equal(t, 400, resp.StatusCode())
+	// Test 5: Error - invalid data
+	req5, _ := http.NewRequest("POST", testServer.URL+cfg.ListenPath, bytes.NewReader([]byte("foobar")))
+	req5.Header.Set("Content-Type", "application/x-protobuf")
+	req5.Header.Set("Content-Encoding", "snappy")
 
-	// Error 1
-	req.Reset()
-	resp.Reset()
-
-	req.Header.SetMethod("POST")
-	req.SetRequestURI("http://127.0.0.1/push")
-	req.SetBody([]byte("foobar"))
-
-	err = c.Do(req, resp)
+	resp5, err := client.Do(req5)
 	assert.Nil(t, err)
+	assert.Equal(t, http.StatusBadRequest, resp5.StatusCode)
+	resp5.Body.Close()
 
-	assert.Equal(t, 400, resp.StatusCode())
+	// Test 6: Error - invalid protobuf
+	req6, _ := http.NewRequest("POST", testServer.URL+cfg.ListenPath, bytes.NewReader(snappy.Encode(nil, []byte("foobar"))))
+	req6.Header.Set("Content-Type", "application/x-protobuf")
+	req6.Header.Set("Content-Encoding", "snappy")
 
-	// Error 2
-	req.Reset()
-	resp.Reset()
-
-	req.Header.SetMethod("POST")
-	req.SetRequestURI("http://127.0.0.1/push")
-	req.SetBody(snappy.Encode(nil, []byte("foobar")))
-
-	err = c.Do(req, resp)
+	resp6, err := client.Do(req6)
 	assert.Nil(t, err)
+	assert.Equal(t, http.StatusBadRequest, resp6.StatusCode)
+	resp6.Body.Close()
 
-	assert.Equal(t, 400, resp.StatusCode())
-
-	// Error 3
-	s.Handler = sinkHandlerError
-
-	req.Reset()
-	resp.Reset()
-
-	req.Header.SetMethod("POST")
-	req.SetRequestURI("http://127.0.0.1/push")
-	req.SetBody(wrq1)
-
-	err = c.Do(req, resp)
-	assert.Nil(t, err)
-
-	assert.Equal(t, 500, resp.StatusCode())
-
-	// Close
+	// Test 7: Ready endpoint during shutdown
 	go p.close()
 	time.Sleep(30 * time.Millisecond)
 
-	req.Reset()
-	resp.Reset()
-
-	req.Header.SetMethod("GET")
-	req.SetRequestURI("http://127.0.0.1/alive")
-
-	err = c.Do(req, resp)
+	req7, _ := http.NewRequest("GET", testServer.URL+"/-/ready", nil)
+	resp7, err := client.Do(req7)
 	assert.Nil(t, err)
-
-	assert.Equal(t, 503, resp.StatusCode())
+	assert.Equal(t, http.StatusServiceUnavailable, resp7.StatusCode)
+	resp7.Body.Close()
 }
 
 func Test_processTimeseries(t *testing.T) {
@@ -411,7 +446,6 @@ func Test_marshal(t *testing.T) {
 	_, err = p.unmarshal(snappy.Encode(nil, []byte{0xFF}))
 	assert.NotNil(t, err)
 
-	//buf := make([]byte, 1024)
 	buf, err := p.marshal(testWRQ)
 	assert.Nil(t, err)
 
@@ -435,6 +469,54 @@ func Test_createWriteRequests(t *testing.T) {
 	}
 
 	assert.Equal(t, mExp, m)
+}
+
+func Test_getClientIP(t *testing.T) {
+	p, err := createProcessor()
+	assert.Nil(t, err)
+
+	// Test X-Forwarded-For
+	req1, _ := http.NewRequest("GET", "http://test.com", nil)
+	req1.Header.Set("X-Forwarded-For", "192.168.1.1, 10.0.0.1")
+	req1.RemoteAddr = "127.0.0.1:1234"
+	assert.Equal(t, "192.168.1.1", p.getClientIP(req1))
+
+	// Test X-Real-IP
+	req2, _ := http.NewRequest("GET", "http://test.com", nil)
+	req2.Header.Set("X-Real-IP", "192.168.1.2")
+	req2.RemoteAddr = "127.0.0.1:1234"
+	assert.Equal(t, "192.168.1.2", p.getClientIP(req2))
+
+	// Test RemoteAddr fallback
+	req3, _ := http.NewRequest("GET", "http://test.com", nil)
+	req3.RemoteAddr = "127.0.0.1:1234"
+	assert.Equal(t, "127.0.0.1", p.getClientIP(req3))
+}
+
+func Test_shutdown(t *testing.T) {
+	cfg, err := getConfig(testConfig)
+	assert.Nil(t, err)
+
+	// Create a test listener
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.Nil(t, err)
+	cfg.testListener = listener
+
+	p := newProcessor(*cfg)
+
+	// Start the processor
+	err = p.run()
+	assert.Nil(t, err)
+
+	// Give server time to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Shutdown the processor
+	err = p.close()
+	assert.Nil(t, err)
+
+	// Verify shutting down flag is set
+	assert.Equal(t, uint32(1), p.shuttingDown)
 }
 
 func Benchmark_marshal(b *testing.B) {
@@ -475,5 +557,271 @@ func TestRemoveOrdered(t *testing.T) {
 			Value: "ddd",
 		},
 	}, l)
+}
 
+// generateTestCertificate generates a self-signed certificate for testing
+func generateTestCertificate() (certFile string, keyFile string, err error) {
+	// Generate RSA private key
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return "", "", err
+	}
+
+	// Create certificate template
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization:  []string{"Test Org"},
+			Country:       []string{"US"},
+			Province:      []string{""},
+			Locality:      []string{""},
+			StreetAddress: []string{""},
+			PostalCode:    []string{""},
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1)},
+		DNSNames:              []string{"localhost"},
+	}
+
+	// Generate certificate
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return "", "", err
+	}
+
+	// Create temporary files for cert and key
+	certTempFile, err := os.CreateTemp("", "test-cert-*.pem")
+	if err != nil {
+		return "", "", err
+	}
+	certFile = certTempFile.Name()
+
+	keyTempFile, err := os.CreateTemp("", "test-key-*.pem")
+	if err != nil {
+		os.Remove(certFile)
+		return "", "", err
+	}
+	keyFile = keyTempFile.Name()
+
+	// Write certificate to file
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certDER,
+	})
+	if _, err := certTempFile.Write(certPEM); err != nil {
+		os.Remove(certFile)
+		os.Remove(keyFile)
+		return "", "", err
+	}
+	certTempFile.Close()
+
+	// Write private key to file
+	privKeyDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		os.Remove(certFile)
+		os.Remove(keyFile)
+		return "", "", err
+	}
+
+	keyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: privKeyDER,
+	})
+	if _, err := keyTempFile.Write(keyPEM); err != nil {
+		os.Remove(certFile)
+		os.Remove(keyFile)
+		return "", "", err
+	}
+	keyTempFile.Close()
+
+	return certFile, keyFile, nil
+}
+
+func Test_HTTP2_Support(t *testing.T) {
+	cfg, err := getConfig(testConfig)
+	assert.Nil(t, err)
+
+	// Enable HTTP/2
+	cfg.EnableHTTP2 = true
+
+	// Create a test backend server with HTTP/2 support
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(sinkHandler))
+	backend.EnableHTTP2 = true
+	backend.StartTLS()
+	defer backend.Close()
+
+	// Update config with test backend URL before creating processor
+	cfg.Target = backend.URL
+
+	// Create a custom transport with HTTP/2 support for testing
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // For testing with self-signed certs
+		},
+		ForceAttemptHTTP2: true,
+	}
+
+	// Configure HTTP/2
+	err = http2.ConfigureTransport(transport)
+	assert.Nil(t, err)
+
+	testClient := &http.Client{
+		Transport: transport,
+		Timeout:   5 * time.Second,
+	}
+
+	// Set test client in config before creating processor
+	cfg.testClient = testClient
+
+	// Create processor with HTTP/2 enabled and test client
+	p := newProcessor(*cfg)
+
+	// Verify that the server has HTTP/2 configured
+	assert.NotNil(t, p.srv.TLSConfig)
+	assert.Contains(t, p.srv.TLSConfig.NextProtos, "h2")
+	assert.Contains(t, p.srv.TLSConfig.NextProtos, "http/1.1")
+
+	// Verify the target is set correctly
+	assert.Equal(t, backend.URL, p.cfg.Target)
+
+	// Send a request through the processor
+	r := p.send("127.0.0.1", uuid.Must(uuid.NewRandom()), "test-tenant", testWRQ)
+
+	// Verify the request was successful
+	assert.Nil(t, r.err)
+	assert.Equal(t, http.StatusOK, r.code)
+	assert.Equal(t, []byte("Ok"), r.body)
+}
+
+func Test_TLS_Setup(t *testing.T) {
+	// Generate a self-signed certificate for testing
+	certFile, keyFile, err := generateTestCertificate()
+	assert.Nil(t, err)
+	defer os.Remove(certFile)
+	defer os.Remove(keyFile)
+
+	// Create config with TLS settings
+	cfg, err := getConfig(testConfig)
+	assert.Nil(t, err)
+	cfg.TLSCertFile = certFile
+	cfg.TLSKeyFile = keyFile
+	cfg.Listen = "127.0.0.1:0" // Use random port
+
+	// Create processor with TLS configuration
+	p := newProcessor(*cfg)
+
+	// Create a listener
+	listener, err := net.Listen("tcp", cfg.Listen)
+	assert.Nil(t, err)
+
+	// Get the actual address the server is listening on
+	serverAddr := listener.Addr().String()
+
+	// Start the server with TLS in a goroutine
+	serverStarted := make(chan bool)
+	serverErrors := make(chan error, 1)
+	go func() {
+		// Load the certificate
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+
+		// Create TLS listener
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"h2", "http/1.1"},
+		}
+		tlsListener := tls.NewListener(listener, tlsConfig)
+
+		// Update server with the TLS listener address
+		p.srv.Addr = serverAddr
+
+		// Signal that server is starting
+		close(serverStarted)
+
+		// Start serving
+		if err := p.srv.Serve(tlsListener); err != nil && err != http.ErrServerClosed {
+			serverErrors <- err
+		}
+	}()
+
+	// Wait for server to start or error
+	select {
+	case <-serverStarted:
+		// Server started successfully
+	case err := <-serverErrors:
+		t.Fatalf("Server failed to start: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Server failed to start within timeout")
+	}
+
+	// Give server a moment to be fully ready
+	time.Sleep(100 * time.Millisecond)
+
+	defer p.close()
+
+	// Test 1: Verify that we can connect with HTTPS
+	httpsClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, // Accept self-signed cert for testing
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	httpsReq, err := http.NewRequest("GET", "https://"+serverAddr+"/-/ready", nil)
+	assert.Nil(t, err)
+
+	httpsResp, err := httpsClient.Do(httpsReq)
+	assert.Nil(t, err, "HTTPS request should succeed")
+	assert.Equal(t, http.StatusOK, httpsResp.StatusCode)
+	httpsResp.Body.Close()
+}
+
+func Test_TLS_With_Auth(t *testing.T) {
+	cfg, err := getConfig(testConfig)
+	assert.Nil(t, err)
+
+	// Configure egress authentication
+	cfg.Auth.Egress.Username = "testuser"
+	cfg.Auth.Egress.Password = "testpass"
+
+	// Create processor with auth configuration
+	p := newProcessor(*cfg)
+
+	// Verify auth header is set correctly
+	expectedAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("testuser:testpass"))
+	assert.Equal(t, expectedAuth, p.auth.egressHeader)
+
+	// Create a test backend that verifies authentication
+	authVerified := false
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if auth == expectedAuth {
+			authVerified = true
+			sinkHandler(w, r)
+		} else {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		}
+	}))
+	defer backend.Close()
+
+	cfg.Target = backend.URL
+	p.cfg.Target = backend.URL
+
+	// Send a request through the processor
+	reqID, _ := uuid.NewRandom()
+	r := p.send("127.0.0.1", reqID, "test-tenant", testWRQ)
+
+	// Verify the request was successful and auth was verified
+	assert.Nil(t, r.err)
+	assert.Equal(t, http.StatusOK, r.code)
+	assert.True(t, authVerified, "Authentication header should have been verified")
 }

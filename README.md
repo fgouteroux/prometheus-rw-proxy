@@ -180,6 +180,13 @@ tenant:
       regex: tenant1|tenant2
     - name: tenant-group2
       regex: tenant3|tenant4
+
+  # list of tenants allowed
+  allow_list:
+    - tenant0
+    - tenant-group1
+    - tenant-group2
+
 ```
 
 ### Prometheus configuration example

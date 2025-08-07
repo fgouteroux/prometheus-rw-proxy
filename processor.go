@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,11 +43,11 @@ var (
 		Help:      "Size in bytes of timeseries batches received.",
 		Buckets:   []float64{0.5, 1, 10, 25, 100, 250, 500, 1000, 5000, 10000, 30000, 300000, 600000, 1800000, 3600000},
 	})
-	metricTimeseriesSkipped = promauto.NewCounter(prometheus.CounterOpts{
+	metricTimeseriesSkipped = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Name:      "timeseries_skipped_total",
 		Help:      "The total number of timeseries skipped.",
-	})
+	}, []string{"reason"})
 	metricTimeseriesReceived = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Name:      "timeseries_received_total",
@@ -336,7 +337,15 @@ func (p *processor) createWriteRequests(wrReqIn *prompb.WriteRequest) (map[strin
 		if err != nil {
 			// Log the error but continue processing other timeseries
 			log.Debugf("proc: Skipping timeseries: %s", err)
-			metricTimeseriesSkipped.Inc()
+
+			reason := "unknown"
+			if strings.Contains(err.Error(), "not found") {
+				reason = "tenant_label_not_found"
+			} else if strings.Contains(err.Error(), "not allowed") {
+				reason = "tenant_label_value_not_allowed"
+			}
+
+			metricTimeseriesSkipped.WithLabelValues(reason).Inc()
 			skippedCount++
 			continue
 		}
@@ -362,7 +371,7 @@ func (p *processor) createWriteRequests(wrReqIn *prompb.WriteRequest) (map[strin
 
 	// Return error only if ALL timeseries were invalid
 	if len(m) == 0 && len(wrReqIn.Timeseries) > 0 {
-		return nil, fmt.Errorf("no valid timeseries found - all missing tenant labels")
+		return nil, fmt.Errorf("no valid timeseries found - all missing/skipping tenant labels")
 	}
 
 	return m, nil
@@ -442,6 +451,12 @@ func (p *processor) findTenantSimple(labels []prompb.Label, configuredLabels []s
 
 func (p *processor) processTimeseries(ts *prompb.TimeSeries) (tenant string, err error) {
 	tenant, idx := p.findTenantSimple(ts.Labels, p.cfg.Tenant.LabelList)
+
+	if tenant != "" && len(p.cfg.Tenant.AllowList) > 0 {
+		if !slices.Contains(p.cfg.Tenant.AllowList, tenant) {
+			return "", fmt.Errorf("label(s) %v value '%s' not allowed: %v", p.cfg.Tenant.LabelList, tenant, ts)
+		}
+	}
 
 	if tenant == "" {
 		if p.cfg.Tenant.Default == "" {

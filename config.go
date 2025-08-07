@@ -70,6 +70,7 @@ type config struct {
 		Default            string         `yaml:"default"`
 		AcceptAll          bool           `yaml:"accept_all"`
 		LabelValueMatcher  []LabelMatcher `yaml:"label_value_matcher"`
+		AllowList          []string       `yaml:"allow_list"`
 	} `yaml:"tenant"`
 
 	// For testing

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -37,7 +38,13 @@ func setupPprof() *http.ServeMux {
 
 func main() {
 	cfgFile := flag.String("config", "", "Path to a config file")
+	versionFlag := flag.Bool("version", false, "Show version")
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Println(Version)
+		os.Exit(0)
+	}
 
 	cfg, err := configLoad(*cfgFile)
 	if err != nil {

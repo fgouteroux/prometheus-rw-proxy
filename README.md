@@ -189,6 +189,11 @@ tenant:
 
 ```
 
+Config could be reloaded with a SIGHUP but only for tenant config:
+```
+kill -HUP $(pgrep -f prometheus-rw-proxy)
+```
+
 ### Prometheus configuration example
 
 ```yaml

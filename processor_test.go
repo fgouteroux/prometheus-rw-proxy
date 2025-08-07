@@ -15,7 +15,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -824,4 +828,357 @@ func Test_TLS_With_Auth(t *testing.T) {
 	assert.Nil(t, r.err)
 	assert.Equal(t, http.StatusOK, r.code)
 	assert.True(t, authVerified, "Authentication header should have been verified")
+}
+
+const integrationTestConfig = `listen: 0.0.0.0:28080
+target: http://127.0.0.1:9090/api/v1/write
+log_level: debug
+timeout: 30s
+listen_metrics_address: 127.0.0.1:28081
+
+tenant:
+  label: "__tenant__"
+  label_list:
+    - "__tenant__"
+  prefix: "initial-"
+  default: "initial_default"
+  label_remove: false
+  allow_list:
+    - "service1"
+    - "service2"
+  label_value_matcher:
+    - name: "prod"
+      regex: "^prod-.*"
+    - name: "dev"
+      regex: "^dev-.*"
+`
+
+const updatedIntegrationTestConfig = `listen: 0.0.0.0:28080
+target: http://127.0.0.1:9090/api/v1/write
+log_level: debug
+timeout: 30s
+listen_metrics_address: 127.0.0.1:28081
+
+tenant:
+  label: "__tenant__"
+  label_list:
+    - "__tenant__"
+    - "__org__"
+  prefix: "updated-"
+  default: "updated_default"
+  label_remove: true
+  allow_list:
+    - "service1"
+    - "service2"
+    - "service3"
+  label_value_matcher:
+    - name: "production"
+      regex: "^production-.*"
+    - name: "staging"
+      regex: "^staging-.*"
+    - name: "development"
+      regex: "^dev-.*"
+`
+
+func Test_IntegrationSighupReload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Create temporary directory for test
+	tmpDir, err := os.MkdirTemp("", "integration_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	configPath := filepath.Join(tmpDir, "config.yml")
+	logPath := filepath.Join(tmpDir, "proxy.log")
+
+	// Write initial config
+	err = os.WriteFile(configPath, []byte(integrationTestConfig), 0644)
+	require.NoError(t, err)
+
+	// Build the proxy if it doesn't exist
+	if _, err := os.Stat("prometheus-rw-proxy"); os.IsNotExist(err) {
+		t.Log("Building prometheus-rw-proxy...")
+		cmd := exec.Command("go", "build", "-o", "prometheus-rw-proxy", ".")
+		err := cmd.Run()
+		require.NoError(t, err, "Failed to build prometheus-rw-proxy")
+	}
+
+	// Start the proxy
+	t.Log("Starting prometheus-rw-proxy...")
+	cmd := exec.Command("./prometheus-rw-proxy", "-config", configPath)
+
+	logFile, err := os.Create(logPath)
+	require.NoError(t, err)
+	defer logFile.Close()
+
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	err = cmd.Start()
+	require.NoError(t, err)
+
+	defer func() {
+		if cmd.Process != nil {
+			cmd.Process.Signal(syscall.SIGTERM)
+			cmd.Wait()
+		}
+	}()
+
+	// Wait for startup
+	t.Log("Waiting for proxy to start...")
+	time.Sleep(3 * time.Second)
+
+	// Verify process is running
+	assert.NoError(t, cmd.Process.Signal(syscall.Signal(0)), "Proxy should be running")
+
+	// Read initial logs
+	initialLogs, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+
+	t.Log("Initial startup logs:")
+	t.Log(string(initialLogs))
+
+	// Update configuration file
+	t.Log("Updating configuration...")
+	err = os.WriteFile(configPath, []byte(updatedIntegrationTestConfig), 0644)
+	require.NoError(t, err)
+
+	// Send SIGHUP
+	t.Log("Sending SIGHUP signal...")
+	err = cmd.Process.Signal(syscall.SIGHUP)
+	require.NoError(t, err)
+
+	// Wait for reload
+	time.Sleep(2 * time.Second)
+
+	// Read updated logs
+	updatedLogs, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+
+	logsStr := string(updatedLogs)
+	t.Log("Logs after SIGHUP:")
+	t.Log(logsStr)
+
+	// Verify reload happened
+	assert.Contains(t, logsStr, "Received SIGHUP", "Should receive SIGHUP signal")
+	assert.Contains(t, logsStr, "Reloading tenant configuration", "Should start reloading")
+	assert.Contains(t, logsStr, "Tenant configuration reloaded successfully", "Should complete reload successfully")
+
+	// Verify specific changes were detected
+	assert.Contains(t, logsStr, "prefix: initial- -> updated-", "Should detect prefix change")
+	assert.Contains(t, logsStr, "default: initial_default -> updated_default", "Should detect default change")
+	assert.Contains(t, logsStr, "label_remove: false -> true", "Should detect label_remove change")
+
+	// Verify label matcher changes
+	assert.Contains(t, logsStr, "=== Label Value Matcher Changes ===", "Should show detailed matcher changes")
+	assert.Contains(t, logsStr, "REMOVED matcher: prod", "Should show removed matcher")
+	assert.Contains(t, logsStr, "ADDED matcher: production", "Should show added matcher")
+	assert.Contains(t, logsStr, "Label matcher summary: 2 old -> 3 new matchers", "Should show matcher summary")
+
+	// Verify process is still running after reload
+	assert.NoError(t, cmd.Process.Signal(syscall.Signal(0)), "Proxy should still be running after reload")
+
+	t.Log("Integration test completed successfully")
+}
+
+func Test_IntegrationSighupInvalidConfig(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Create temporary directory for test
+	tmpDir, err := os.MkdirTemp("", "integration_invalid_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	configPath := filepath.Join(tmpDir, "config.yml")
+	logPath := filepath.Join(tmpDir, "proxy.log")
+
+	// Write initial valid config
+	err = os.WriteFile(configPath, []byte(integrationTestConfig), 0644)
+	require.NoError(t, err)
+
+	// Start the proxy
+	t.Log("Starting prometheus-rw-proxy...")
+	cmd := exec.Command("./prometheus-rw-proxy", "-config", configPath)
+
+	logFile, err := os.Create(logPath)
+	require.NoError(t, err)
+	defer logFile.Close()
+
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	err = cmd.Start()
+	require.NoError(t, err)
+
+	defer func() {
+		if cmd.Process != nil {
+			cmd.Process.Signal(syscall.SIGTERM)
+			cmd.Wait()
+		}
+	}()
+
+	// Wait for startup
+	time.Sleep(3 * time.Second)
+
+	// Verify process is running
+	assert.NoError(t, cmd.Process.Signal(syscall.Signal(0)), "Proxy should be running")
+
+	// Write invalid configuration (missing tenant labels, no regex issues)
+	invalidConfig := `listen: 0.0.0.0:28080
+target: http://127.0.0.1:9090/api/v1/write
+log_level: debug
+timeout: 30s
+listen_metrics_address: 127.0.0.1:28081
+
+tenant:
+  label: ""
+  label_list: bad_type
+  default: "should_not_apply"
+  prefix: "invalid-"
+  label_remove: false
+`
+
+	t.Log("Writing invalid configuration...")
+	err = os.WriteFile(configPath, []byte(invalidConfig), 0644)
+	require.NoError(t, err)
+
+	// Send SIGHUP with invalid config
+	t.Log("Sending SIGHUP with invalid config...")
+	err = cmd.Process.Signal(syscall.SIGHUP)
+	require.NoError(t, err)
+
+	// Wait for reload attempt
+	time.Sleep(2 * time.Second)
+
+	// Read logs
+	logs, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+
+	logsStr := string(logs)
+	t.Log("Logs after invalid config SIGHUP:")
+	t.Log(logsStr)
+
+	// Verify error handling
+	assert.Contains(t, logsStr, "Received SIGHUP", "Should receive SIGHUP signal")
+	assert.Contains(t, logsStr, "Failed to reload tenant config", "Should fail to reload invalid config")
+
+	// The error can be either validation error or regex compilation error
+	hasValidationError := strings.Contains(logsStr, "tenant label or label_list must be specified")
+	hasRegexError := strings.Contains(logsStr, "invalid regex for 'invalid'")
+	hasConfigLoadError := strings.Contains(logsStr, "failed to load config")
+
+	assert.True(t, hasValidationError || hasRegexError || hasConfigLoadError,
+		"Should show some kind of validation/config error")
+
+	if hasRegexError {
+		t.Log("Got regex compilation error (expected)")
+		assert.Contains(t, logsStr, "error parsing regexp", "Should show regex parsing error")
+	}
+
+	if hasValidationError {
+		t.Log("Got tenant validation error (also valid)")
+	}
+
+	if hasConfigLoadError {
+		t.Log("Got config loading error (also valid)")
+	}
+
+	// Verify process is still running after failed reload
+	assert.NoError(t, cmd.Process.Signal(syscall.Signal(0)), "Proxy should still be running after failed reload")
+
+	t.Log("Invalid config test completed successfully")
+}
+
+func Test_IntegrationSighupRegexError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Create temporary directory for test
+	tmpDir, err := os.MkdirTemp("", "integration_regex_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	configPath := filepath.Join(tmpDir, "config.yml")
+	logPath := filepath.Join(tmpDir, "proxy.log")
+
+	// Write initial valid config
+	err = os.WriteFile(configPath, []byte(integrationTestConfig), 0644)
+	require.NoError(t, err)
+
+	// Start the proxy
+	t.Log("Starting prometheus-rw-proxy...")
+	cmd := exec.Command("./prometheus-rw-proxy", "-config", configPath)
+
+	logFile, err := os.Create(logPath)
+	require.NoError(t, err)
+	defer logFile.Close()
+
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	err = cmd.Start()
+	require.NoError(t, err)
+
+	defer func() {
+		if cmd.Process != nil {
+			cmd.Process.Signal(syscall.SIGTERM)
+			cmd.Wait()
+		}
+	}()
+
+	// Wait for startup
+	time.Sleep(3 * time.Second)
+
+	// Write config with invalid regex
+	invalidRegexConfig := `listen: 0.0.0.0:28080
+target: http://127.0.0.1:9090/api/v1/write
+log_level: debug
+timeout: 30s
+listen_metrics_address: 127.0.0.1:28081
+
+tenant:
+  label: "__tenant__"
+  label_list:
+    - "__tenant__"
+  default: "test"
+  label_value_matcher:
+    - name: "invalid"
+      regex: "[invalid-regex"
+`
+
+	t.Log("Writing config with invalid regex...")
+	err = os.WriteFile(configPath, []byte(invalidRegexConfig), 0644)
+	require.NoError(t, err)
+
+	// Send SIGHUP with invalid regex config
+	t.Log("Sending SIGHUP with invalid regex config...")
+	err = cmd.Process.Signal(syscall.SIGHUP)
+	require.NoError(t, err)
+
+	// Wait for reload attempt
+	time.Sleep(2 * time.Second)
+
+	// Read logs
+	logs, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+
+	logsStr := string(logs)
+	t.Log("Logs after invalid regex config SIGHUP:")
+	t.Log(logsStr)
+
+	// Verify regex error handling
+	assert.Contains(t, logsStr, "Received SIGHUP", "Should receive SIGHUP signal")
+	assert.Contains(t, logsStr, "Failed to reload tenant config", "Should fail to reload invalid config")
+	assert.Contains(t, logsStr, "invalid regex for 'invalid'", "Should show regex validation error")
+	assert.Contains(t, logsStr, "error parsing regexp", "Should show regex parsing error details")
+
+	// Verify process is still running after failed reload
+	assert.NoError(t, cmd.Process.Signal(syscall.Signal(0)), "Proxy should still be running after failed reload")
+
+	t.Log("Invalid regex config test completed successfully")
 }

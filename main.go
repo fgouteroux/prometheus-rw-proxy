@@ -4,12 +4,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
-
-	"net/http"
-	"net/http/pprof"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
@@ -51,13 +50,25 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Set initial log level
+	lvl, err := log.ParseLevel(cfg.LogLevel)
+	if err != nil {
+		log.Fatalf("Unable to parse log level: %s", err)
+	}
+	log.SetLevel(lvl)
+
+	cfgJSON, _ := json.Marshal(cfg)
+	log.Debugf("Effective config: %+v", string(cfgJSON))
+
+	proc := newProcessor(*cfg)
+
 	// Start pprof server with dedicated mux (only if configured)
 	if cfg.ListenPprof != "" {
 		go func() {
 			pprofMux := setupPprof()
 			server := &http.Server{
 				Addr:         cfg.ListenPprof,
-				Handler:      pprofMux, // Use dedicated mux
+				Handler:      pprofMux,
 				ReadTimeout:  cfg.Timeout,
 				WriteTimeout: cfg.Timeout,
 				IdleTimeout:  cfg.IdleTimeout,
@@ -83,33 +94,46 @@ func main() {
 		}
 	}()
 
-	lvl, err := log.ParseLevel(cfg.LogLevel)
-	if err != nil {
-		log.Fatalf("Unable to parse log level: %s", err)
-	}
-
-	log.SetLevel(lvl)
-
-	cfgJSON, _ := json.Marshal(cfg)
-	log.Warnf("Effective config: %+v", string(cfgJSON))
-
-	proc := newProcessor(*cfg)
-
 	if err = proc.run(); err != nil {
 		log.Fatalf("Unable to start: %s", err)
 	}
 
-	log.Warnf("Listening on %s, sending to %s", cfg.Listen, cfg.Target)
-	log.Warnf("Started %s", Version)
+	log.Infof("Listening on %s, sending to %s", cfg.Listen, cfg.Target)
+
+	tenantReloader := NewTenantConfigReloader(*cfgFile, proc)
+	log.Debugf("Tenant config reloader initialized for: %s", *cfgFile)
+	log.Debugf("Send SIGHUP signal to reload tenant configuration: kill -HUP %d", os.Getpid())
 
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM, os.Interrupt)
-	<-ch
+	signal.Notify(ch, syscall.SIGTERM, os.Interrupt, syscall.SIGHUP)
 
-	log.Warn("Shutting down, draining requests")
-	if err = proc.close(); err != nil {
-		log.Errorf("Error during shutdown: %s", err)
+	log.Debugf("Signal handler started (PID: %d), listening for SIGTERM, SIGINT, and SIGHUP", os.Getpid())
+	log.Info("Application is ready and running...")
+
+	for {
+		switch <-ch {
+		case syscall.SIGHUP:
+			// Handle SIGHUP for manual tenant config reload
+			log.Info("Received SIGHUP, reloading tenant configuration...")
+			if tenantReloader != nil {
+				if err := tenantReloader.ReloadTenantConfig(); err != nil {
+					log.Errorf("Failed to reload tenant config: %v", err)
+				} else {
+					log.Info("Tenant configuration reloaded successfully")
+				}
+			} else {
+				log.Warn("No config file specified, cannot reload tenant configuration")
+			}
+		case syscall.SIGTERM, os.Interrupt:
+			// Handle shutdown signals
+			log.Warn("Shutting down, draining requests")
+
+			if err = proc.close(); err != nil {
+				log.Errorf("Error during shutdown: %s", err)
+			}
+
+			log.Warnf("Finished")
+			return
+		}
 	}
-
-	log.Warnf("Finished")
 }

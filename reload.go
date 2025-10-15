@@ -67,6 +67,7 @@ func (cr *TenantConfigReloader) validateTenantConfig(tenantCfg *struct {
 	LabelRemove        bool           `yaml:"label_remove"`
 	Header             string         `yaml:"header"`
 	Default            string         `yaml:"default"`
+	DispatchAll        string         `yaml:"dispatch_all"`
 	AcceptAll          bool           `yaml:"accept_all"`
 	LabelValueMatcher  []LabelMatcher `yaml:"label_value_matcher"`
 	AllowList          []string       `yaml:"allow_list"`
@@ -95,6 +96,7 @@ func (cr *TenantConfigReloader) applyTenantConfig(newTenantCfg *struct {
 	LabelRemove        bool           `yaml:"label_remove"`
 	Header             string         `yaml:"header"`
 	Default            string         `yaml:"default"`
+	DispatchAll        string         `yaml:"dispatch_all"`
 	AcceptAll          bool           `yaml:"accept_all"`
 	LabelValueMatcher  []LabelMatcher `yaml:"label_value_matcher"`
 	AllowList          []string       `yaml:"allow_list"`
@@ -154,6 +156,7 @@ func (cr *TenantConfigReloader) logTenantConfigChanges(oldCfg, newCfg *struct {
 	LabelRemove        bool           `yaml:"label_remove"`
 	Header             string         `yaml:"header"`
 	Default            string         `yaml:"default"`
+	DispatchAll        string         `yaml:"dispatch_all"`
 	AcceptAll          bool           `yaml:"accept_all"`
 	LabelValueMatcher  []LabelMatcher `yaml:"label_value_matcher"`
 	AllowList          []string       `yaml:"allow_list"`
@@ -186,6 +189,10 @@ func (cr *TenantConfigReloader) logTenantConfigChanges(oldCfg, newCfg *struct {
 
 	if oldCfg.Default != newCfg.Default {
 		changes = append(changes, fmt.Sprintf("default: %s -> %s", oldCfg.Default, newCfg.Default))
+	}
+
+	if oldCfg.DispatchAll != newCfg.DispatchAll {
+		changes = append(changes, fmt.Sprintf("dispatch_all: %s -> %s", oldCfg.DispatchAll, newCfg.DispatchAll))
 	}
 
 	if oldCfg.AcceptAll != newCfg.AcceptAll {

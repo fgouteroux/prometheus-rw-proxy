@@ -68,6 +68,7 @@ type config struct {
 		LabelRemove        bool           `yaml:"label_remove"`
 		Header             string         `yaml:"header"`
 		Default            string         `yaml:"default"`
+		DispatchAll        string         `yaml:"dispatch_all"`
 		AcceptAll          bool           `yaml:"accept_all"`
 		LabelValueMatcher  []LabelMatcher `yaml:"label_value_matcher"`
 		AllowList          []string       `yaml:"allow_list"`
@@ -195,6 +196,7 @@ func configLoad(file string) (*config, error) {
 	cfg.Tenant.LabelRemove = getEnvBool("PRWPROXY_TENANT_LABEL_REMOVE", cfg.Tenant.LabelRemove)
 	cfg.Tenant.Header = getEnv("PRWPROXY_TENANT_HEADER", cfg.Tenant.Header)
 	cfg.Tenant.Default = getEnv("PRWPROXY_TENANT_DEFAULT", cfg.Tenant.Default)
+	cfg.Tenant.DispatchAll = getEnv("PRWPROXY_TENANT_DISPATCH_ALL", cfg.Tenant.DispatchAll)
 	cfg.Tenant.AcceptAll = getEnvBool("PRWPROXY_TENANT_ACCEPT_ALL", cfg.Tenant.AcceptAll)
 
 	// Set defaults

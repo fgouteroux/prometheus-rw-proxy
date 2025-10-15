@@ -350,6 +350,21 @@ func (p *processor) createWriteRequests(wrReqIn *prompb.WriteRequest) (map[strin
 			continue
 		}
 
+		// if tenant value match tenant DispatchAll value append timeserie to all tenant in allowlist
+		if tenant == p.cfg.Tenant.DispatchAll {
+			for _, t := range p.cfg.Tenant.AllowList {
+				metricTimeseriesReceived.WithLabelValues(t).Inc()
+				wrReqOut, ok := m[t]
+				if !ok {
+					wrReqOut = &prompb.WriteRequest{}
+					m[t] = wrReqOut
+				}
+
+				wrReqOut.Timeseries = append(wrReqOut.Timeseries, ts)
+			}
+			continue
+		}
+
 		if p.cfg.MetricsIncludeTenant {
 			metricTimeseriesReceived.WithLabelValues(tenant).Inc()
 		} else {
@@ -452,7 +467,12 @@ func (p *processor) findTenantSimple(labels []prompb.Label, configuredLabels []s
 func (p *processor) processTimeseries(ts *prompb.TimeSeries) (tenant string, err error) {
 	tenant, idx := p.findTenantSimple(ts.Labels, p.cfg.Tenant.LabelList)
 
-	if tenant != "" && len(p.cfg.Tenant.AllowList) > 0 {
+	var dispatchAll bool
+	if tenant != "" && tenant == p.cfg.Tenant.DispatchAll {
+		dispatchAll = true
+	}
+
+	if !dispatchAll && tenant != "" && len(p.cfg.Tenant.AllowList) > 0 {
 		if !slices.Contains(p.cfg.Tenant.AllowList, tenant) {
 			return "", fmt.Errorf("label(s) %v value '%s' not allowed: %v", p.cfg.Tenant.LabelList, tenant, ts)
 		}

@@ -153,6 +153,10 @@ tenant:
   # env: PRWPROXY_TENANT_DEFAULT
   default: foobar
 
+  # Enable sending timeseries for each tenant ID defined in allow_list if the label value matches
+  # env: PRWPROXY_TENANT_DISPATCH_ALL
+  dispatch_all: __all__
+
   # Enable if you want all metrics from Prometheus to be accepted with a 204 HTTP code
   # regardless of the response from upstream. This can lose metrics if Cortex/Mimir is
   # throwing rejections.
